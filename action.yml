@@ -94,6 +94,20 @@ inputs:
       impersonation in the chain.
     default: ''
     required: false
+  universe:
+    description: |-
+      The Google Cloud universe to use for constructing API endpoints. The
+      default universe is "googleapis.com", which corresponds to
+      https://cloud.google.com. Trusted Partner Cloud and Google Distributed
+      Hosted Cloud should set this to their universe address.
+    required: false
+    default: 'googleapis.com'
+  request_reason:
+    description: |-
+      An optional Reason Request System Parameter for each API call made by the
+      GitHub Action. This will inject the "X-Goog-Request-Reason" HTTP header,
+      which will provide user-supplied information in Google Cloud audit logs.
+    required: false
   cleanup_credentials:
     description: |-
       If true, the action will remove any created credentials from the
@@ -124,6 +138,30 @@ inputs:
     default: ''
     required: false
 
+  # retries - TODO - remove in v3.0
+  retries:
+    description: |-
+      Number of times to retry a failed authentication attempt. This is useful
+      for automated pipelines that may execute before IAM permissions are fully
+      propagated.
+    deprecationMessage: |-
+      This field is no longer used and will be removed in a future release.
+    required: false
+  backoff:
+    description: |-
+      Delay time before trying another authentication attempt. This is
+      implemented using a fibonacci backoff method (e.g. 1-1-2-3-5). The default
+      value is 250 milliseconds.
+    deprecationMessage: |-
+      This field is no longer used and will be removed in a future release.
+    required: false
+  backoff_limit:
+    description: |-
+      Limits the retry backoff to the specified value.
+    deprecationMessage: |-
+      This field is no longer used and will be removed in a future release.
+    required: false
+
   # id token params
   id_token_audience:
     description: |-
@@ -148,14 +186,14 @@ outputs:
     description: |-
       Path on the local filesystem where the generated credentials file resides.
       This is only available if "create_credentials_file" was set to true.
+  auth_token:
+    description: |-
+      The intermediate authentication token, which could be used to call other
+      Google Cloud APIs, depending on how you configured IAM.
   access_token:
     description: |-
       The Google Cloud access token for calling other Google Cloud APIs. This is
       only available when "token_format" is "access_token".
-  access_token_expiration:
-    description: |-
-      The RFC3339 UTC "Zulu" format timestamp for the access token. This is only
-      available when "token_format" is "access_token".
   id_token:
     description: |-
       The Google Cloud ID token. This is only available when "token_format" is
@@ -166,6 +204,6 @@ branding:
   color: 'blue'
 
 runs:
-  using: 'node16'
+  using: 'node20'
   main: 'dist/main/index.js'
   post: 'dist/post/index.js'

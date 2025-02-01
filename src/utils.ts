@@ -1,6 +1,28 @@
-'use strict';
+// Copyright 2023 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-import { randomFilename } from '@google-github-actions/actions-utils';
+import {
+  isServiceAccountKey,
+  parseCredential,
+  randomFilename,
+} from '@google-github-actions/actions-utils';
+
+// Do not listen to the linter - this can NOT be rewritten as an ES6 import statement.
+export const { version: appVersion } = require('../package.json');
+
+// userAgent is the default user agent.
+export const userAgent = `google-github-actions:auth/${appVersion}`;
 
 /**
  * buildDomainWideDelegationJWT constructs an _unsigned_ JWT to be used for a
@@ -36,6 +58,79 @@ export function buildDomainWideDelegationJWT(
   }
 
   return JSON.stringify(body);
+}
+
+/**
+ * computeProjectID attempts to compute the best project ID from the given
+ * inputs.
+ */
+export function computeProjectID(
+  projectID?: string,
+  serviceAccount?: string,
+  serviceAccountKeyJSON?: string,
+): string | undefined {
+  if (projectID) {
+    return projectID;
+  }
+
+  // sa-name@<project-id>.iam.gserviceaccount.com
+  const fromEmail = projectIDFromServiceAccountEmail(serviceAccount);
+  if (fromEmail) {
+    return fromEmail;
+  }
+
+  // Extract from the key
+  if (serviceAccountKeyJSON) {
+    const credential = parseCredential(serviceAccountKeyJSON);
+    if (isServiceAccountKey(credential) && credential.project_id) {
+      return credential.project_id;
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * getServiceAccountEmail extracts the service account email from the given
+ * fields.
+ */
+export function computeServiceAccountEmail(
+  serviceAccountEmail?: string,
+  serviceAccountKeyJSON?: string,
+): string | undefined {
+  if (serviceAccountEmail) {
+    return serviceAccountEmail;
+  }
+
+  if (serviceAccountKeyJSON) {
+    const credential = parseCredential(serviceAccountKeyJSON);
+    if (isServiceAccountKey(credential) && credential.client_email) {
+      return credential.client_email;
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * projectIDFromServiceAccountEmail attempts to extract the project ID from the
+ * service account email.
+ */
+export function projectIDFromServiceAccountEmail(serviceAccount?: string): string | null {
+  if (!serviceAccount) {
+    return null;
+  }
+
+  const emailParts = serviceAccount.split('@');
+  if (emailParts.length !== 2) {
+    return null;
+  }
+
+  const addressParts = emailParts[1].split('.');
+  if (addressParts.length < 2) {
+    return null;
+  }
+  return addressParts[0];
 }
 
 /**

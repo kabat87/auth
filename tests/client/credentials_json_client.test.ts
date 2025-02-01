@@ -1,7 +1,19 @@
-'use strict';
+// Copyright 2023 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-import 'mocha';
-import { expect } from 'chai';
+import { test } from 'node:test';
+import assert from 'node:assert';
 
 import { join as pathjoin } from 'path';
 import { readFileSync } from 'fs';
@@ -9,7 +21,8 @@ import { tmpdir } from 'os';
 
 import { randomFilename } from '@google-github-actions/actions-utils';
 
-import { CredentialsJSONClient } from '../../src/client/credentials_json_client';
+import { NullLogger } from '../../src/logger';
+import { ServiceAccountKeyClient } from '../../src/client/service_account_key_json';
 
 // Yes, this is a real private key. No, it's not valid for authenticating
 // Google Cloud.
@@ -28,97 +41,69 @@ const credentialsJSON = `
 }
 `;
 
-describe('CredentialsJSONClient', () => {
-  describe('#parseServiceAccountKeyJSON', () => {
-    it('throws exception on invalid json', async () => {
-      const fn = (): CredentialsJSONClient => {
-        return new CredentialsJSONClient({
-          credentialsJSON: 'invalid json',
-        });
-      };
-
-      expect(fn).to.throw(SyntaxError);
-    });
-
-    it('handles base64', async () => {
-      const fn = (): CredentialsJSONClient => {
-        return new CredentialsJSONClient({
-          credentialsJSON: Buffer.from('{}').toString('base64'),
-        });
-      };
-
-      expect(fn).to.not.throw(SyntaxError);
-    });
+test('#parseServiceAccountKeyJSON', { concurrency: true }, async (suite) => {
+  await suite.test('throws exception on invalid json', async () => {
+    await assert.rejects(async () => {
+      new ServiceAccountKeyClient({
+        logger: new NullLogger(),
+        universe: 'googleapis.com',
+        serviceAccountKey: 'invalid json',
+      });
+    }, SyntaxError);
   });
 
-  describe('#getAuthToken', () => {
-    it('signs a jwt', async () => {
-      const client = new CredentialsJSONClient({
-        credentialsJSON: credentialsJSON,
+  await suite.test('handles base64', async () => {
+    await assert.rejects(async () => {
+      new ServiceAccountKeyClient({
+        logger: new NullLogger(),
+        universe: 'googleapis.com',
+        serviceAccountKey: 'base64',
       });
-
-      const token = await client.getAuthToken();
-      expect(token).to.be;
-    });
+    }, SyntaxError);
   });
+});
 
-  describe('#signJWT', () => {
-    it('signs a jwt', async () => {
-      const client = new CredentialsJSONClient({
-        credentialsJSON: credentialsJSON,
-      });
-
-      const token = await client.signJWT('thisismy.jwt');
-      expect(token).to.be;
+test('#getToken', { concurrency: true }, async (suite) => {
+  await suite.test('gets a token', async () => {
+    const client = new ServiceAccountKeyClient({
+      logger: new NullLogger(),
+      universe: 'googleapis.com',
+      serviceAccountKey: credentialsJSON,
     });
+
+    const token = await client.getToken();
+    assert.ok(token);
   });
+});
 
-  describe('#getProjectID', () => {
-    it('extracts project ID from the json', async () => {
-      const client = new CredentialsJSONClient({
-        credentialsJSON: credentialsJSON,
-      });
-
-      const result = await client.getProjectID();
-      expect(result).to.eq('my-project');
+test('#signJWT', { concurrency: true }, async (suite) => {
+  await suite.test('signs a jwt', async () => {
+    const client = new ServiceAccountKeyClient({
+      logger: new NullLogger(),
+      universe: 'googleapis.com',
+      serviceAccountKey: credentialsJSON,
     });
 
-    it('prefers the override if given', async () => {
-      const client = new CredentialsJSONClient({
-        projectID: 'my-other-project',
-        credentialsJSON: credentialsJSON,
-      });
-
-      const result = await client.getProjectID();
-      expect(result).to.eq('my-other-project');
-    });
+    const token = await client.signJWT('thisismy.jwt');
+    assert.ok(token);
   });
+});
 
-  describe('#getServiceAccount', () => {
-    it('extracts service account from the json', async () => {
-      const client = new CredentialsJSONClient({
-        credentialsJSON: credentialsJSON,
-      });
-
-      const result = await client.getServiceAccount();
-      expect(result).to.eq('my-service-account@my-project.iam.gserviceaccount.com');
+test('#createCredentialsFile', { concurrency: true }, async (suite) => {
+  await suite.test('writes the file', async () => {
+    const outputFile = pathjoin(tmpdir(), randomFilename());
+    const client = new ServiceAccountKeyClient({
+      logger: new NullLogger(),
+      universe: 'googleapis.com',
+      serviceAccountKey: credentialsJSON,
     });
-  });
 
-  describe('#createCredentialsFile', () => {
-    it('writes the file', async () => {
-      const outputFile = pathjoin(tmpdir(), randomFilename());
-      const client = new CredentialsJSONClient({
-        credentialsJSON: credentialsJSON,
-      });
+    const exp = JSON.parse(credentialsJSON);
 
-      const exp = JSON.parse(credentialsJSON);
+    const pth = await client.createCredentialsFile(outputFile);
+    const data = readFileSync(pth);
+    const got = JSON.parse(data.toString('utf8'));
 
-      const pth = await client.createCredentialsFile(outputFile);
-      const data = readFileSync(pth);
-      const got = JSON.parse(data.toString('utf8'));
-
-      expect(got).to.deep.equal(exp);
-    });
+    assert.deepStrictEqual(got, exp);
   });
 });

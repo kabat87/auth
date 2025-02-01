@@ -1,34 +1,51 @@
-'use strict';
+// Copyright 2023 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 import { join as pathjoin } from 'path';
 
 import {
-  debug as logDebug,
   exportVariable,
   getBooleanInput,
   getIDToken,
   getInput,
-  info as logInfo,
   setFailed,
   setOutput,
   setSecret,
-  warning as logWarning,
 } from '@actions/core';
 import {
   errorMessage,
   exactlyOneOf,
   isEmptyDir,
   isPinnedToHead,
-  parseCSV,
+  parseMultilineCSV,
   parseDuration,
   pinnedToHeadWarning,
 } from '@google-github-actions/actions-utils';
 
-import { WorkloadIdentityClient } from './client/workload_identity_client';
-import { CredentialsJSONClient } from './client/credentials_json_client';
-import { AuthClient } from './client/auth_client';
-import { BaseClient } from './base';
-import { buildDomainWideDelegationJWT, generateCredentialsFilename } from './utils';
+import {
+  AuthClient,
+  IAMCredentialsClient,
+  ServiceAccountKeyClient,
+  WorkloadIdentityFederationClient,
+} from './client/client';
+import { Logger } from './logger';
+import {
+  buildDomainWideDelegationJWT,
+  computeProjectID,
+  computeServiceAccountEmail,
+  generateCredentialsFilename,
+} from './utils';
 
 const secretsWarning =
   `If you are specifying input values via GitHub secrets, ensure the secret ` +
@@ -41,27 +58,33 @@ const oidcWarning =
   `GitHub Actions workflow permissions are incorrect, or this job is being ` +
   `run from a fork. For more information, please see https://docs.github.com/en/actions/security-guides/automatic-token-authentication#permissions-for-the-github_token`;
 
-/**
- * Executes the main action, documented inline.
- */
-async function run(): Promise<void> {
+export async function run(logger: Logger) {
   // Warn if pinned to HEAD
   if (isPinnedToHead()) {
-    logWarning(pinnedToHeadWarning('v0'));
+    logger.warning(pinnedToHeadWarning('v2'));
   }
 
   try {
     // Load configuration.
-    const projectID = getInput('project_id');
-    const workloadIdentityProvider = getInput('workload_identity_provider');
-    const serviceAccount = getInput('service_account');
-    const audience =
-      getInput('audience') || `https://iam.googleapis.com/${workloadIdentityProvider}`;
-    const credentialsJSON = getInput('credentials_json');
-    const createCredentialsFile = getBooleanInput('create_credentials_file');
-    const exportEnvironmentVariables = getBooleanInput('export_environment_variables');
-    const tokenFormat = getInput('token_format');
-    const delegates = parseCSV(getInput('delegates'));
+    const projectID = computeProjectID(
+      getInput(`project_id`),
+      getInput(`service_account`),
+      getInput(`credentials_json`),
+    );
+    const workloadIdentityProvider = getInput(`workload_identity_provider`);
+    const serviceAccount = computeServiceAccountEmail(
+      getInput(`service_account`),
+      getInput('credentials_json'),
+    );
+    const oidcTokenAudience =
+      getInput(`audience`) || `https://iam.googleapis.com/${workloadIdentityProvider}`;
+    const credentialsJSON = getInput(`credentials_json`);
+    const createCredentialsFile = getBooleanInput(`create_credentials_file`);
+    const exportEnvironmentVariables = getBooleanInput(`export_environment_variables`);
+    const tokenFormat = getInput(`token_format`);
+    const delegates = parseMultilineCSV(getInput(`delegates`));
+    const universe = getInput(`universe`);
+    const requestReason = getInput(`request_reason`);
 
     // Ensure exactly one of workload_identity_provider and credentials_json was
     // provided.
@@ -73,19 +96,10 @@ async function run(): Promise<void> {
       );
     }
 
-    // Ensure a service_account was provided if using WIF.
-    if (workloadIdentityProvider && !serviceAccount) {
-      throw new Error(
-        'The GitHub Action workflow must specify a "service_account" to ' +
-          'impersonate when using "workload_identity_provider"! ' +
-          secretsWarning,
-      );
-    }
-
     // Instantiate the correct client based on the provided input parameters.
     let client: AuthClient;
     if (workloadIdentityProvider) {
-      logDebug(`Using workload identity provider "${workloadIdentityProvider}"`);
+      logger.debug(`Using workload identity provider "${workloadIdentityProvider}"`);
 
       // If we're going to do the OIDC dance, we need to make sure these values
       // are set. If they aren't, core.getIDToken() will fail and so will
@@ -96,21 +110,27 @@ async function run(): Promise<void> {
         throw new Error(oidcWarning);
       }
 
-      const token = await getIDToken(audience);
-      client = new WorkloadIdentityClient({
-        projectID: projectID,
-        providerID: workloadIdentityProvider,
+      const oidcToken = await getIDToken(oidcTokenAudience);
+      client = new WorkloadIdentityFederationClient({
+        logger: logger,
+        universe: universe,
+        requestReason: requestReason,
+
+        githubOIDCToken: oidcToken,
+        githubOIDCTokenRequestURL: oidcTokenRequestURL,
+        githubOIDCTokenRequestToken: oidcTokenRequestToken,
+        githubOIDCTokenAudience: oidcTokenAudience,
+        workloadIdentityProviderName: workloadIdentityProvider,
         serviceAccount: serviceAccount,
-        token: token,
-        audience: audience,
-        oidcTokenRequestToken: oidcTokenRequestToken,
-        oidcTokenRequestURL: oidcTokenRequestURL,
       });
     } else {
-      logDebug(`Using credentials JSON`);
-      client = new CredentialsJSONClient({
-        projectID: projectID,
-        credentialsJSON: credentialsJSON,
+      logger.debug(`Using credentials JSON`);
+      client = new ServiceAccountKeyClient({
+        logger: logger,
+        universe: universe,
+        requestReason: requestReason,
+
+        serviceAccountKey: credentialsJSON,
       });
     }
 
@@ -119,7 +139,7 @@ async function run(): Promise<void> {
     // fails, which means continue-on-error actions will still have the file
     // available.
     if (createCredentialsFile) {
-      logDebug(`Creating credentials file`);
+      logger.debug(`Creating credentials file`);
 
       // Note: We explicitly and intentionally export to GITHUB_WORKSPACE
       // instead of RUNNER_TEMP, because RUNNER_TEMP is not shared with
@@ -146,8 +166,8 @@ async function run(): Promise<void> {
       // repository.
       const githubWorkspaceIsEmpty = await isEmptyDir(githubWorkspace);
       if (githubWorkspaceIsEmpty) {
-        logWarning(
-          `The "create_credentials_file" option is true, but the current ` +
+        logger.info(
+          `⚠️ The "create_credentials_file" option is true, but the current ` +
             `GitHub workspace is empty. Did you forget to use ` +
             `"actions/checkout" before this step? If you do not intend to ` +
             `share authentication with future steps in this job, set ` +
@@ -159,7 +179,7 @@ async function run(): Promise<void> {
       const outputFile = generateCredentialsFilename();
       const outputPath = pathjoin(githubWorkspace, outputFile);
       const credentialsPath = await client.createCredentialsFile(outputPath);
-      logInfo(`Created credentials file at "${credentialsPath}"`);
+      logger.info(`Created credentials file at "${credentialsPath}"`);
 
       // Output to be available to future steps.
       setOutput('credentials_file_path', credentialsPath);
@@ -168,28 +188,52 @@ async function run(): Promise<void> {
         // CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE is picked up by gcloud to
         // use a specific credential file (subject to change and equivalent to
         // auth/credential_file_override).
-        exportVariableAndWarn('CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE', credentialsPath);
+        exportVariable('CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE', credentialsPath);
 
         // GOOGLE_APPLICATION_CREDENTIALS is used by Application Default
         // Credentials in all GCP client libraries.
-        exportVariableAndWarn('GOOGLE_APPLICATION_CREDENTIALS', credentialsPath);
+        exportVariable('GOOGLE_APPLICATION_CREDENTIALS', credentialsPath);
 
         // GOOGLE_GHA_CREDS_PATH is used by other Google GitHub Actions.
-        exportVariableAndWarn('GOOGLE_GHA_CREDS_PATH', credentialsPath);
+        exportVariable('GOOGLE_GHA_CREDS_PATH', credentialsPath);
       }
     }
 
     // Set the project ID environment variables to the computed values.
-    const computedProjectID = await client.getProjectID();
-    setOutput('project_id', computedProjectID);
+    if (!projectID) {
+      logger.info(
+        `⚠️ Failed to compute a project ID from the given inputs. Neither the ` +
+          `"project_id" output nor any environment variables will be ` +
+          `exported. If you require these values in other steps, specify the ` +
+          `"project_id" input directly.`,
+      );
+    } else {
+      setOutput('project_id', projectID);
 
-    if (exportEnvironmentVariables) {
-      exportVariableAndWarn('CLOUDSDK_CORE_PROJECT', computedProjectID);
-      exportVariableAndWarn('CLOUDSDK_PROJECT', computedProjectID);
-      exportVariableAndWarn('GCLOUD_PROJECT', computedProjectID);
-      exportVariableAndWarn('GCP_PROJECT', computedProjectID);
-      exportVariableAndWarn('GOOGLE_CLOUD_PROJECT', computedProjectID);
+      if (exportEnvironmentVariables) {
+        exportVariable('CLOUDSDK_CORE_PROJECT', projectID);
+        exportVariable('CLOUDSDK_PROJECT', projectID);
+        exportVariable('GCLOUD_PROJECT', projectID);
+        exportVariable('GCP_PROJECT', projectID);
+        exportVariable('GOOGLE_CLOUD_PROJECT', projectID);
+      }
     }
+
+    // Attempt to generate a token. This will ensure the action correctly errors
+    // if the credentials are misconfigured. This is also required so the value
+    // can be set as an output for future authentication calls.
+    const authToken = await client.getToken();
+    logger.debug(`Successfully generated auth token`);
+    setSecret(authToken);
+    setOutput('auth_token', authToken);
+
+    // Create the credential client, we might not use it, but it's basically free.
+    const iamCredentialsClient = new IAMCredentialsClient({
+      logger: logger,
+      universe: universe,
+
+      authToken: authToken,
+    });
 
     switch (tokenFormat) {
       case '': {
@@ -199,23 +243,36 @@ async function run(): Promise<void> {
         break;
       }
       case 'access_token': {
-        logDebug(`Creating access token`);
+        logger.debug(`Creating access token`);
 
         const accessTokenLifetime = parseDuration(getInput('access_token_lifetime'));
-        const accessTokenScopes = parseCSV(getInput('access_token_scopes'));
+        const accessTokenScopes = parseMultilineCSV(getInput('access_token_scopes'));
         const accessTokenSubject = getInput('access_token_subject');
-        const serviceAccount = await client.getServiceAccount();
+
+        // Ensure a service_account was provided if using WIF.
+        if (!serviceAccount) {
+          throw new Error(
+            'The GitHub Action workflow must specify a "service_account" to ' +
+              'use when generating an OAuth 2.0 Access Token. ' +
+              secretsWarning,
+          );
+        }
+
+        let accessToken: string;
 
         // If a subject was provided, use the traditional OAuth 2.0 flow to
         // perform Domain-Wide Delegation. Otherwise, use the modern IAM
         // Credentials endpoints.
-        let accessToken, expiration;
         if (accessTokenSubject) {
-          logInfo(
-            `An access token subject was specified, triggering Domain-Wide ` +
-              `Delegation flow. This flow does not support specifying an ` +
-              `access token lifetime of greater than 1 hour.`,
-          );
+          logger.debug(`Using Domain-Wide Delegation flow`);
+
+          if (accessTokenLifetime > 3600) {
+            logger.info(
+              `An access token subject was specified, triggering Domain-Wide ` +
+                `Delegation flow. This flow does not support specifying an ` +
+                `access token lifetime of greater than 1 hour.`,
+            );
+          }
 
           const unsignedJWT = buildDomainWideDelegationJWT(
             serviceAccount,
@@ -223,39 +280,46 @@ async function run(): Promise<void> {
             accessTokenScopes,
             accessTokenLifetime,
           );
-          const signedJWT = await client.signJWT(unsignedJWT, delegates);
-          ({ accessToken, expiration } = await BaseClient.googleOAuthToken(signedJWT));
+          const signedJWT = await client.signJWT(unsignedJWT);
+          accessToken =
+            await iamCredentialsClient.generateDomainWideDelegationAccessToken(signedJWT);
         } else {
-          const authToken = await client.getAuthToken();
-          ({ accessToken, expiration } = await BaseClient.googleAccessToken(authToken, {
+          logger.debug(`Using normal access token flow`);
+          accessToken = await iamCredentialsClient.generateAccessToken({
             serviceAccount,
             delegates,
             scopes: accessTokenScopes,
             lifetime: accessTokenLifetime,
-          }));
+          });
         }
 
         setSecret(accessToken);
         setOutput('access_token', accessToken);
-        setOutput('access_token_expiration', expiration);
         break;
       }
       case 'id_token': {
-        logDebug(`Creating id token`);
+        logger.debug(`Creating id token`);
 
         const idTokenAudience = getInput('id_token_audience', { required: true });
         const idTokenIncludeEmail = getBooleanInput('id_token_include_email');
-        const serviceAccount = await client.getServiceAccount();
 
-        const authToken = await client.getAuthToken();
-        const { token } = await BaseClient.googleIDToken(authToken, {
+        // Ensure a service_account was provided if using WIF.
+        if (!serviceAccount) {
+          throw new Error(
+            'The GitHub Action workflow must specify a "service_account" to ' +
+              'use when generating an OAuth 2.0 Access Token. ' +
+              secretsWarning,
+          );
+        }
+
+        const idToken = await iamCredentialsClient.generateIDToken({
           serviceAccount,
           audience: idTokenAudience,
           delegates,
           includeEmail: idTokenIncludeEmail,
         });
-        setSecret(token);
-        setOutput('id_token', token);
+        setSecret(idToken);
+        setOutput('id_token', idToken);
         break;
       }
       default: {
@@ -268,22 +332,6 @@ async function run(): Promise<void> {
   }
 }
 
-/**
- * exportVariableAndWarn exports the given key as an environment variable set to
- * the provided value. If a value already exists, it is overwritten and an
- * warning is emitted.
- *
- * @param key Environment variable key.
- * @param value Environment variable value.
- */
-function exportVariableAndWarn(key: string, value: string) {
-  const existing = process.env[key];
-  if (existing) {
-    const old = JSON.stringify(existing);
-    logWarning(`Overwriting existing environment variable ${key} (was: ${old})`);
-  }
-
-  exportVariable(key, value);
+if (require.main === module) {
+  run(new Logger());
 }
-
-run();
